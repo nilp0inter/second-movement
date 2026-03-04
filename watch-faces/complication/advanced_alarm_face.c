@@ -26,6 +26,9 @@
 #include <string.h>
 
 #include "advanced_alarm_face.h"
+#if __has_include("advanced_alarm_config.h")
+#include "advanced_alarm_config.h"
+#endif
 #include "watch.h"
 #include "watch_utility.h"
 #include "watch_common_display.h"
@@ -247,6 +250,16 @@ void advanced_alarm_face_setup(uint8_t watch_face_index, void **context_ptr) {
             state->alarm[i].beeps = 5;
             state->alarm[i].pitch = 1;
         }
+#ifdef ADVANCED_ALARM_PRESETS
+        {
+            static const alarm_setting_t presets[] = ADVANCED_ALARM_PRESETS;
+            uint8_t n = sizeof(presets) / sizeof(presets[0]);
+            uint8_t start = ADVANCED_ALARM_PRESETS_START;
+            for (uint8_t i = 0; i < n && (start + i) < ALARM_ALARMS; i++) {
+                state->alarm[start + i] = presets[i];
+            }
+        }
+#endif
         state->alarm_handled_minute = -1;
         _wait_ticks = -1;
 
