@@ -53,15 +53,12 @@
  */
 
 #include "movement.h"
-#include "chirpy_tx.h"
 
 typedef struct {
     uint32_t timestamp;
     uint8_t steps;
     uint32_t current_code;
     uint8_t current_index;
-    bool chirping;
-    chirpy_encoder_state_t encoder_state;
 } totp_lfs_state_t;
 
 void totp_lfs_face_setup(uint8_t watch_face_index, void ** context_ptr);
