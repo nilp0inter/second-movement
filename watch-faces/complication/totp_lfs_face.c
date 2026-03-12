@@ -33,6 +33,7 @@
 #include "filesystem.h"
 
 #include "totp_lfs_face.h"
+#include "chirpy_tx.h"
 
 #define MAX_TOTP_RECORDS 30
 #define MAX_TOTP_SECRET_SIZE 128
@@ -279,6 +280,66 @@ static void totp_face_display(totp_lfs_state_t *totp_state) {
     watch_display_text_with_fallback(WATCH_POSITION_BOTTOM, buf, buf);
 }
 
+// Chirpy TX static variables and callbacks
+static uint8_t totp_chirp_data[6];  // 6-digit ASCII OTP
+static uint16_t totp_chirp_data_ix;
+static totp_lfs_state_t *totp_chirp_state;
+
+static uint8_t _totp_chirp_get_next_byte(uint8_t *next_byte) {
+    if (totp_chirp_data_ix >= 6) return 0;
+    *next_byte = totp_chirp_data[totp_chirp_data_ix++];
+    return 1;
+}
+
+static void _totp_chirp_on_done(void) {
+    if (totp_chirp_state) {
+        totp_chirp_state->chirping = false;
+        totp_chirp_state = NULL;
+    }
+    watch_clear_indicator(WATCH_INDICATOR_BELL);
+}
+
+static bool _totp_chirp_raw_source(uint16_t position, void *userdata,
+                                    uint16_t *period, uint16_t *duration) {
+    if (position < 6) {
+        if (position % 2) {
+            *period = WATCH_BUZZER_PERIOD_REST;
+            *duration = 56;
+        } else {
+            *period = NotePeriods[BUZZER_NOTE_A5];
+            *duration = 8;
+        }
+        return false;
+    }
+
+    totp_lfs_state_t *state = (totp_lfs_state_t *)userdata;
+    uint8_t tone = chirpy_get_next_tone(&state->encoder_state);
+    if (tone == 255) return true;
+
+    *period = chirpy_get_tone_period(tone);
+    *duration = 3;
+    return false;
+}
+
+static void _totp_start_chirp(totp_lfs_state_t *state) {
+    if (num_totp_records == 0) return;
+
+    // Encode OTP as 6-digit ASCII string
+    uint32_t code = state->current_code;
+    for (int i = 5; i >= 0; i--) {
+        totp_chirp_data[i] = '0' + (code % 10);
+        code /= 10;
+    }
+    totp_chirp_data_ix = 0;
+    totp_chirp_state = state;
+
+    state->chirping = true;
+    watch_set_indicator(WATCH_INDICATOR_BELL);
+
+    chirpy_init_encoder(&state->encoder_state, _totp_chirp_get_next_byte);
+    watch_buzzer_play_raw_source(_totp_chirp_raw_source, state, _totp_chirp_on_done);
+}
+
 bool totp_lfs_face_loop(movement_event_t event, void *context) {
 
     totp_lfs_state_t *totp_state = (totp_lfs_state_t *)context;
@@ -286,13 +347,17 @@ bool totp_lfs_face_loop(movement_event_t event, void *context) {
     switch (event.event_type) {
         case EVENT_TICK:
             totp_state->timestamp++;
-            totp_face_display(totp_state);
+            if (!totp_state->chirping) {
+                totp_face_display(totp_state);
+            }
             break;
         case EVENT_ACTIVATE:
             totp_face_display(totp_state);
             break;
         case EVENT_TIMEOUT:
-            movement_move_to_face(0);
+            if (!totp_state->chirping) {
+                movement_move_to_face(0);
+            }
             break;
         case EVENT_ALARM_BUTTON_UP:
             totp_face_set_record(totp_state, (totp_state->current_index + 1) % num_totp_records);
@@ -302,8 +367,12 @@ bool totp_lfs_face_loop(movement_event_t event, void *context) {
             totp_face_set_record(totp_state, (totp_state->current_index + num_totp_records - 1) % num_totp_records);
             totp_face_display(totp_state);
             break;
-        case EVENT_ALARM_BUTTON_DOWN:
         case EVENT_ALARM_LONG_PRESS:
+            if (!totp_state->chirping) {
+                _totp_start_chirp(totp_state);
+            }
+            break;
+        case EVENT_ALARM_BUTTON_DOWN:
         case EVENT_LIGHT_BUTTON_DOWN:
             break;
         case EVENT_LIGHT_LONG_PRESS:
