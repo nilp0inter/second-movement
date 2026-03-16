@@ -52,8 +52,14 @@
  * activate the light.
  */
 
+#include <stdbool.h>
 #include "movement.h"
 #include "fesk_session.h"
+
+#define TOTP_PIN_MODE_NORMAL  0
+#define TOTP_PIN_MODE_ENTRY   1
+#define TOTP_PIN_MODE_SETUP   2
+#define TOTP_PIN_MODE_CONFIRM 3
 
 typedef struct {
     uint32_t timestamp;
@@ -61,6 +67,15 @@ typedef struct {
     uint32_t current_code;
     uint8_t current_index;
     fesk_session_t fesk_session;
+    // PIN state
+    uint8_t pin_mode;
+    uint8_t pin_digits[6];
+    uint8_t pin_cursor;
+    uint8_t pin_length;
+    uint8_t confirm_digits[6];
+    uint8_t failed_attempts;
+    uint8_t message_ticks;
+    bool unlocked;
 } totp_lfs_state_t;
 
 void totp_lfs_face_setup(uint8_t watch_face_index, void ** context_ptr);

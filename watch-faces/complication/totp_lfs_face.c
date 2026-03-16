@@ -38,6 +38,11 @@
 #define MAX_TOTP_RECORDS 30
 #define MAX_TOTP_SECRET_SIZE 128
 #define TOTP_FILE "totp_uris.txt"
+#define TOTP_PIN_FILE "totp_pin.dat"
+#define TOTP_PIN_VERSION 0x01
+#define TOTP_PIN_DATA_SIZE 9
+#define TOTP_PIN_MAX_ATTEMPTS 10
+#define TOTP_PIN_MAX_LENGTH 6
 
 const char* TOTP_URI_START = "otpauth://totp/";
 
@@ -190,6 +195,74 @@ static void totp_lfs_face_read_file(char *filename) {
     }
 }
 
+// --- PIN helpers ---
+
+static bool totp_pin_read(uint8_t *pin_digits, uint8_t *pin_length, uint8_t *failed_attempts) {
+    uint8_t buf[TOTP_PIN_DATA_SIZE];
+    if (!filesystem_read_file(TOTP_PIN_FILE, (char *)buf, TOTP_PIN_DATA_SIZE)) return false;
+    if (buf[0] != TOTP_PIN_VERSION) return false;
+    *pin_length = buf[1];
+    if (*pin_length < 4 || *pin_length > TOTP_PIN_MAX_LENGTH) return false;
+    memcpy(pin_digits, &buf[2], TOTP_PIN_MAX_LENGTH);
+    *failed_attempts = buf[8];
+    return true;
+}
+
+static void totp_pin_write(const uint8_t *pin_digits, uint8_t pin_length, uint8_t failed_attempts) {
+    uint8_t buf[TOTP_PIN_DATA_SIZE];
+    buf[0] = TOTP_PIN_VERSION;
+    buf[1] = pin_length;
+    memcpy(&buf[2], pin_digits, TOTP_PIN_MAX_LENGTH);
+    buf[8] = failed_attempts;
+    filesystem_write_file(TOTP_PIN_FILE, (char *)buf, TOTP_PIN_DATA_SIZE);
+}
+
+static void totp_pin_display(totp_lfs_state_t *state, uint8_t subsecond) {
+    char buf[7];
+    bool blink = (subsecond % 2) == 1;
+
+    switch (state->pin_mode) {
+        case TOTP_PIN_MODE_SETUP:
+            watch_display_text_with_fallback(WATCH_POSITION_TOP_LEFT, "SEt", "SE");
+            watch_display_text(WATCH_POSITION_TOP_RIGHT, "  ");
+            break;
+        case TOTP_PIN_MODE_CONFIRM:
+            watch_display_text_with_fallback(WATCH_POSITION_TOP_LEFT, "COn", "CO");
+            watch_display_text(WATCH_POSITION_TOP_RIGHT, "  ");
+            break;
+        case TOTP_PIN_MODE_ENTRY:
+            watch_display_text_with_fallback(WATCH_POSITION_TOP_LEFT, "PIn", "PI");
+            watch_display_text(WATCH_POSITION_TOP_RIGHT, "  ");
+            break;
+        default:
+            return;
+    }
+
+    for (int i = 0; i < TOTP_PIN_MAX_LENGTH; i++) {
+        if (i == state->pin_cursor && blink) {
+            buf[i] = ' ';
+        } else if (i < state->pin_length) {
+            buf[i] = '0' + state->pin_digits[i];
+        } else {
+            buf[i] = ' ';
+        }
+    }
+    buf[TOTP_PIN_MAX_LENGTH] = '\0';
+    watch_display_text(WATCH_POSITION_BOTTOM, buf);
+}
+
+static void totp_pin_reset_digits(totp_lfs_state_t *state) {
+    memset(state->pin_digits, 0, TOTP_PIN_MAX_LENGTH);
+    state->pin_cursor = 0;
+    state->pin_length = TOTP_PIN_MAX_LENGTH;
+}
+
+static void totp_pin_erase_secrets(void) {
+    filesystem_rm(TOTP_FILE);
+    filesystem_rm(TOTP_PIN_FILE);
+    num_totp_records = 0;
+}
+
 void totp_lfs_face_setup(uint8_t watch_face_index, void ** context_ptr) {
     (void) watch_face_index;
     if (*context_ptr == NULL) {
@@ -247,14 +320,37 @@ void totp_lfs_face_activate(void *context) {
 
 #if __EMSCRIPTEN__
     if (num_totp_records == 0) {
-        // Doing this here rather than in setup makes things a bit more pleasant in the simulator, since there's no easy way to trigger
-        // setup again after uploading the data.
         totp_lfs_face_read_file(TOTP_FILE);
     }
 #endif
 
     totp_state->timestamp = movement_get_utc_timestamp();
-    totp_face_set_record(totp_state, 0);
+
+    // Determine PIN mode
+    uint8_t stored_pin[TOTP_PIN_MAX_LENGTH];
+    uint8_t stored_len;
+    uint8_t stored_attempts;
+    if (filesystem_file_exists(TOTP_PIN_FILE) && totp_pin_read(stored_pin, &stored_len, &stored_attempts)) {
+        if (stored_attempts >= TOTP_PIN_MAX_ATTEMPTS) {
+            totp_pin_erase_secrets();
+            totp_state->pin_mode = TOTP_PIN_MODE_NORMAL;
+        } else {
+            totp_state->pin_mode = TOTP_PIN_MODE_ENTRY;
+            totp_state->failed_attempts = stored_attempts;
+            totp_pin_reset_digits(totp_state);
+            movement_request_tick_frequency(4);
+        }
+    } else if (filesystem_file_exists(TOTP_FILE) && num_totp_records > 0) {
+        totp_state->pin_mode = TOTP_PIN_MODE_SETUP;
+        totp_pin_reset_digits(totp_state);
+        movement_request_tick_frequency(4);
+    } else {
+        totp_state->pin_mode = TOTP_PIN_MODE_NORMAL;
+    }
+
+    if (totp_state->pin_mode == TOTP_PIN_MODE_NORMAL) {
+        totp_face_set_record(totp_state, 0);
+    }
 }
 
 static void totp_face_display(totp_lfs_state_t *totp_state) {
@@ -327,9 +423,107 @@ static void _totp_start_fesk(totp_lfs_state_t *state) {
     fesk_session_start(&state->fesk_session);
 }
 
+static bool totp_pin_handle_event(movement_event_t event, totp_lfs_state_t *state) {
+    switch (event.event_type) {
+        case EVENT_TICK:
+            if (state->message_ticks > 0) {
+                state->message_ticks--;
+                break;
+            }
+            // fall through
+        case EVENT_ACTIVATE:
+            totp_pin_display(state, event.subsecond);
+            break;
+        case EVENT_ALARM_BUTTON_UP:
+            // Increment current digit
+            state->pin_digits[state->pin_cursor] = (state->pin_digits[state->pin_cursor] + 1) % 10;
+            totp_pin_display(state, 0);
+            break;
+        case EVENT_ALARM_LONG_PRESS:
+            // Rapid increment
+            state->pin_digits[state->pin_cursor] = (state->pin_digits[state->pin_cursor] + 1) % 10;
+            totp_pin_display(state, 0);
+            break;
+        case EVENT_LIGHT_BUTTON_UP:
+            // Advance cursor
+            state->pin_cursor = (state->pin_cursor + 1) % state->pin_length;
+            totp_pin_display(state, 0);
+            break;
+        case EVENT_LIGHT_LONG_PRESS:
+            if (state->pin_mode == TOTP_PIN_MODE_SETUP) {
+                // Move to confirm mode
+                memcpy(state->confirm_digits, state->pin_digits, TOTP_PIN_MAX_LENGTH);
+                memset(state->pin_digits, 0, TOTP_PIN_MAX_LENGTH);
+                state->pin_cursor = 0;
+                state->pin_mode = TOTP_PIN_MODE_CONFIRM;
+                totp_pin_display(state, 0);
+            } else if (state->pin_mode == TOTP_PIN_MODE_CONFIRM) {
+                // Check if digits match
+                if (memcmp(state->pin_digits, state->confirm_digits, state->pin_length) == 0) {
+                    // PIN set successfully
+                    totp_pin_write(state->pin_digits, state->pin_length, 0);
+                    state->unlocked = true;
+                    state->pin_mode = TOTP_PIN_MODE_NORMAL;
+                    movement_request_tick_frequency(1);
+                    totp_face_set_record(state, 0);
+                    totp_face_display(state);
+                } else {
+                    // Mismatch - show "no" briefly, restart setup
+                    watch_display_text(WATCH_POSITION_FULL, "  no      ");
+                    state->pin_mode = TOTP_PIN_MODE_SETUP;
+                    totp_pin_reset_digits(state);
+                    state->message_ticks = 4;
+                }
+            } else if (state->pin_mode == TOTP_PIN_MODE_ENTRY) {
+                // Check PIN
+                uint8_t stored_pin[TOTP_PIN_MAX_LENGTH];
+                uint8_t stored_len;
+                uint8_t stored_attempts;
+                if (totp_pin_read(stored_pin, &stored_len, &stored_attempts) &&
+                    memcmp(state->pin_digits, stored_pin, stored_len) == 0) {
+                    // Correct PIN
+                    totp_pin_write(stored_pin, stored_len, 0);
+                    state->unlocked = true;
+                    state->pin_mode = TOTP_PIN_MODE_NORMAL;
+                    movement_request_tick_frequency(1);
+                    totp_face_set_record(state, 0);
+                    totp_face_display(state);
+                } else {
+                    // Wrong PIN
+                    state->failed_attempts++;
+                    totp_pin_write(stored_pin, stored_len, state->failed_attempts);
+                    if (state->failed_attempts >= TOTP_PIN_MAX_ATTEMPTS) {
+                        totp_pin_erase_secrets();
+                        watch_display_text(WATCH_POSITION_FULL, " ERASE    ");
+                        state->pin_mode = TOTP_PIN_MODE_NORMAL;
+                        state->message_ticks = 8;
+                        movement_request_tick_frequency(1);
+                    } else {
+                        watch_display_text(WATCH_POSITION_FULL, " Error    ");
+                        totp_pin_reset_digits(state);
+                        state->message_ticks = 4;
+                    }
+                }
+            }
+            break;
+        case EVENT_TIMEOUT:
+            movement_move_to_face(0);
+            break;
+        default:
+            movement_default_loop_handler(event);
+            break;
+    }
+    return true;
+}
+
 bool totp_lfs_face_loop(movement_event_t event, void *context) {
 
     totp_lfs_state_t *totp_state = (totp_lfs_state_t *)context;
+
+    // Handle PIN modes
+    if (totp_state->pin_mode != TOTP_PIN_MODE_NORMAL) {
+        return totp_pin_handle_event(event, totp_state);
+    }
 
     switch (event.event_type) {
         case EVENT_TICK:
@@ -374,5 +568,7 @@ bool totp_lfs_face_loop(movement_event_t event, void *context) {
 }
 
 void totp_lfs_face_resign(void *context) {
-    (void) context;
+    totp_lfs_state_t *state = (totp_lfs_state_t *)context;
+    state->unlocked = false;
+    movement_request_tick_frequency(1);
 }
