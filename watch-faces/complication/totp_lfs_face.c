@@ -33,6 +33,7 @@
 #include "filesystem.h"
 
 #include "totp_lfs_face.h"
+#include "fesk_session.h"
 
 #define MAX_TOTP_RECORDS 30
 #define MAX_TOTP_SECRET_SIZE 128
@@ -279,6 +280,53 @@ static void totp_face_display(totp_lfs_state_t *totp_state) {
     watch_display_text_with_fallback(WATCH_POSITION_BOTTOM, buf, buf);
 }
 
+static void _totp_fesk_bottom_display(const char *text) {
+    watch_display_text(WATCH_POSITION_TOP_RIGHT, "  ");
+    watch_display_text(WATCH_POSITION_BOTTOM, text);
+}
+
+static void _totp_fesk_on_countdown_tick(uint8_t seconds_remaining, void *user_data) {
+    (void)user_data;
+    char buf[7];
+    if (seconds_remaining > 0) {
+        snprintf(buf, sizeof(buf), "    %2u", (unsigned int)seconds_remaining);
+    } else {
+        snprintf(buf, sizeof(buf), "  GO  ");
+    }
+    _totp_fesk_bottom_display(buf);
+}
+
+static void _totp_fesk_on_countdown_complete(void *user_data) {
+    (void)user_data;
+    _totp_fesk_bottom_display("  GO  ");
+}
+
+static void _totp_fesk_on_tx_start(void *user_data) {
+    (void)user_data;
+    _totp_fesk_bottom_display(" SEnd ");
+}
+
+static void _totp_fesk_on_tx_end(void *user_data) {
+    (void)user_data;
+    _totp_fesk_bottom_display(" dONE ");
+}
+
+static void _totp_start_fesk(totp_lfs_state_t *state) {
+    if (num_totp_records == 0) return;
+    static char otp_str[7];
+    snprintf(otp_str, sizeof(otp_str), "%06lu", state->current_code);
+    fesk_session_config_t config = fesk_session_config_defaults();
+    config.static_message = otp_str;
+    config.enable_countdown = true;
+    config.mode = FESK_MODE_4FSK;
+    config.on_countdown_tick = _totp_fesk_on_countdown_tick;
+    config.on_countdown_complete = _totp_fesk_on_countdown_complete;
+    config.on_transmission_start = _totp_fesk_on_tx_start;
+    config.on_transmission_end = _totp_fesk_on_tx_end;
+    fesk_session_init(&state->fesk_session, &config);
+    fesk_session_start(&state->fesk_session);
+}
+
 bool totp_lfs_face_loop(movement_event_t event, void *context) {
 
     totp_lfs_state_t *totp_state = (totp_lfs_state_t *)context;
@@ -286,13 +334,17 @@ bool totp_lfs_face_loop(movement_event_t event, void *context) {
     switch (event.event_type) {
         case EVENT_TICK:
             totp_state->timestamp++;
-            totp_face_display(totp_state);
+            if (fesk_session_is_idle(&totp_state->fesk_session)) {
+                totp_face_display(totp_state);
+            }
             break;
         case EVENT_ACTIVATE:
             totp_face_display(totp_state);
             break;
         case EVENT_TIMEOUT:
-            movement_move_to_face(0);
+            if (fesk_session_is_idle(&totp_state->fesk_session)) {
+                movement_move_to_face(0);
+            }
             break;
         case EVENT_ALARM_BUTTON_UP:
             totp_face_set_record(totp_state, (totp_state->current_index + 1) % num_totp_records);
@@ -302,8 +354,12 @@ bool totp_lfs_face_loop(movement_event_t event, void *context) {
             totp_face_set_record(totp_state, (totp_state->current_index + num_totp_records - 1) % num_totp_records);
             totp_face_display(totp_state);
             break;
-        case EVENT_ALARM_BUTTON_DOWN:
         case EVENT_ALARM_LONG_PRESS:
+            if (fesk_session_is_idle(&totp_state->fesk_session)) {
+                _totp_start_fesk(totp_state);
+            }
+            break;
+        case EVENT_ALARM_BUTTON_DOWN:
         case EVENT_LIGHT_BUTTON_DOWN:
             break;
         case EVENT_LIGHT_LONG_PRESS:

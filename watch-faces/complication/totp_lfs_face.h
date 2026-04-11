@@ -53,12 +53,14 @@
  */
 
 #include "movement.h"
+#include "fesk_session.h"
 
 typedef struct {
     uint32_t timestamp;
     uint8_t steps;
     uint32_t current_code;
     uint8_t current_index;
+    fesk_session_t fesk_session;
 } totp_lfs_state_t;
 
 void totp_lfs_face_setup(uint8_t watch_face_index, void ** context_ptr);
